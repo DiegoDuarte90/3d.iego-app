@@ -17,7 +17,7 @@ st.success("Si ves esto, Streamlit está funcionando 👌")
 
 st.subheader("Mini demo dataframe")
 df = pd.DataFrame({"Item": ["A","B","C"], "Valor":[1,2,3]})
-st.dataframe(df, use_container_width=True)
+st.dataframe(df, width="stretch")
 
 st.subheader("Variables de entorno")
 st.code("\\n".join([f"{k}={v}" for k,v in os.environ.items() if k in ["PORT","ENV","DEBUG"]]) or "(sin .env)")
