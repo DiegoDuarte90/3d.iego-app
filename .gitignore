@@ -1,1 +1,6 @@
+# Ignorar base local
+data/app.db
 data/*.db
+
+# Ignorar PDFs generados
+data/pdfs/
