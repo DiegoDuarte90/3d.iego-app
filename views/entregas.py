@@ -286,7 +286,8 @@ def _base_filename(cliente: str, fecha_iso: str, entrega_nro: int) -> str:
     d = datetime.strptime(fecha_iso, "%Y-%m-%d")
     cliente_print = cliente.replace("Particular ", "") if cliente.lower().startswith("particular ") else cliente
     cliente_print = _sanitize_name(cliente_print).upper()
-    return f"ENTREGA DE MERCADERIA - {cliente_print} {d.day}-{d.month} N{entrega_nro}.pdf"
+    return f"ENTREGA DE MERCADERIA - {cliente_print} {d.day}-{d.month}-{d.year} N{entrega_nro}.pdf"
+
 
 
 def _unique_path(path: Path) -> Path:
