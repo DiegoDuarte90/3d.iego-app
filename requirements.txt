@@ -2,3 +2,4 @@
 pandas
 python-dotenv
 plotly
+reportlab>=3.6

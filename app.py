@@ -1,23 +1,28 @@
-﻿import os
-from datetime import datetime
+﻿# app.py
 import streamlit as st
-import pandas as pd
+from lib import db
+from views import revendedores, detalle_revendedor, entregas
 
-st.set_page_config(page_title="3D.IEGO - Dev", layout="wide")
+st.set_page_config(page_title="3D.IEGO", layout="wide")
+db.init_db()
 
-st.title("3D.IEGO - App de desarrollo")
-st.caption("Entorno local • " + datetime.now().strftime("%Y-%m-%d %H:%M"))
-
+# Sidebar MENÚ
 with st.sidebar:
-    st.subheader("Opciones")
-    nombre = st.text_input("Tu nombre", "Diego")
-    st.write("Hola,", nombre)
+    st.subheader("MENÚ")
+    colA = st.button("Revendedores", use_container_width=True)
+    colB = st.button("Entregas", use_container_width=True)
+    if colA:
+        st.query_params.update({"page": "revendedores"})
+        st.rerun()
+    if colB:
+        st.query_params.update({"page": "entregas"})
+        st.rerun()
 
-st.success("Si ves esto, Streamlit está funcionando 👌")
-
-st.subheader("Mini demo dataframe")
-df = pd.DataFrame({"Item": ["A","B","C"], "Valor":[1,2,3]})
-st.dataframe(df, width="stretch")
-
-st.subheader("Variables de entorno")
-st.code("\\n".join([f"{k}={v}" for k,v in os.environ.items() if k in ["PORT","ENV","DEBUG"]]) or "(sin .env)")
+# Router
+page = st.query_params.get("page", "revendedores")
+if page == "detalle":
+    detalle_revendedor.render()
+elif page == "entregas":
+    entregas.render()
+else:
+    revendedores.render()
