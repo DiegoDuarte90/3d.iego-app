@@ -10,6 +10,7 @@ from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Table, TableStyle, Spacer, Image, Flowable
 )
 from reportlab.lib.enums import TA_LEFT, TA_RIGHT, TA_CENTER
+from reportlab.pdfbase.pdfmetrics import stringWidth  # ← para medir ancho de texto
 
 
 # --------------------------
@@ -116,21 +117,44 @@ def _build_header(cliente: str, fecha_iso: str, page_width: float):
 def _build_items_table(items: List[Dict], width: float) -> Table:
     styles = getSampleStyleSheet()
 
-    # Encabezado grande y centrado
+    # Encabezado grande y centrado (igual)
     st_head = ParagraphStyle("st_head", parent=styles["Normal"], fontSize=20, leading=22, alignment=TA_CENTER)
-    # Filas
-    st_cell = ParagraphStyle("st_cell", parent=styles["Normal"], fontSize=14, leading=16, alignment=TA_LEFT)
-    st_num  = ParagraphStyle("st_num",  parent=styles["Normal"], fontSize=14, leading=16, alignment=TA_RIGHT)
-    # Total row styles
+
+    # ▶ LETRA DEL ÍTEM MÁS GRANDE
+    st_cell = ParagraphStyle("st_cell", parent=styles["Normal"], fontSize=30, leading=30, alignment=TA_LEFT, spaceBefore=0, spaceAfter=0)
+    st_num  = ParagraphStyle("st_num",  parent=styles["Normal"], fontSize=18, leading=21, alignment=TA_RIGHT)
+
+    # Total row styles (igual que antes)
     st_total_left  = ParagraphStyle("st_total_left",  parent=styles["Normal"], fontSize=22, leading=24, alignment=TA_CENTER)
     st_total_right = ParagraphStyle("st_total_right", parent=styles["Normal"], fontSize=26, leading=28, alignment=TA_RIGHT)
 
-    # Anchos como el ejemplo
-    col_c = 22 * mm
-    col_precio = 42 * mm
-    col_total  = 42 * mm
+    # ---- Anchos DINÁMICOS para evitar wraps en encabezados y TOTAL ----
+    # Padding lateral de la tabla (6 pt a cada lado)
+    PADDING_PT = 12
+
+    # Cantidad: tomamos el más ancho (contenido y encabezado)
+    qty_texts = [str(int(it.get("cantidad", 0))) for it in items] or ["0"]
+    qty_texts.append("C")  # encabezado
+    qty_w_pt = max(stringWidth(t, "Helvetica", st_head.fontSize if t == "C" else st_num.fontSize) for t in qty_texts) + PADDING_PT
+    col_c = max(16 * mm, qty_w_pt)  # nunca menos de 16 mm
+
+    # Precio: máximo entre encabezado y valores
+    precio_texts = [ _miles(float(it.get("precio", 0))) for it in items ] or ["$ 0"]
+    precio_texts.append("Precio")
+    precio_w_pt = max(stringWidth(t, "Helvetica", st_head.fontSize if t == "Precio" else st_num.fontSize) for t in precio_texts) + PADDING_PT
+    col_precio = max(26 * mm, precio_w_pt)  # mínimo 26 mm para no partir "Precio"
+
+    # Total: considerar también el TOTAL FINAL en fuente 26
+    total_texts = [ _miles(float(it.get("total", float(it.get("cantidad",0))*float(it.get("precio",0))))) for it in items ] or ["$ 0"]
+    total_texts.append("Total")
+    total_w_rows = max(stringWidth(t, "Helvetica", st_head.fontSize if t == "Total" else st_num.fontSize) for t in total_texts) + PADDING_PT
+    total_w_grand = stringWidth(_miles(sum(float(it.get("total", float(it.get("cantidad",0))*float(it.get("precio",0)))) for it in items)), "Helvetica", st_total_right.fontSize) + PADDING_PT
+    col_total = max(28 * mm, total_w_rows, total_w_grand)  # mínimo 28 mm y que entre el "Total Final"
+
+    # El resto del ancho para "Artículo"
     col_art = max(60 * mm, width - (col_c + col_precio + col_total))
 
+    # ---- Datos ----
     data = [
         [Paragraph("<b>Artículo</b>", st_head),
          Paragraph("<b>C</b>", st_head),
@@ -146,41 +170,34 @@ def _build_items_table(items: List[Dict], width: float) -> Table:
         tot    = float(it.get("total", cant * precio))
         total_val += tot
         data.append([
-            Paragraph(pieza, st_cell),
-            Paragraph(str(cant), st_head),             # centrado
+            Paragraph(pieza, st_cell),             # ▶ ÍTEM con letra 18
+            Paragraph(str(cant), st_head),         # centrado
             Paragraph(_miles(precio), st_num),
             Paragraph(_miles(tot), st_num),
         ])
 
-    # ---- Fila de TOTAL al final (dentro de la tabla) ----
-    idx_total = len(data)  # índice de la nueva fila
+    # Fila TOTAL (en una sola línea)
+    idx_total = len(data)
     data.append([
         Paragraph("<b>Total Final:</b>", st_total_left),
-        "", "",  # se van a combinar (SPAN)
+        "", "",
         Paragraph(f"<b>{_miles(total_val)}</b>", st_total_right),
     ])
 
     tbl = Table(data, colWidths=[col_art, col_c, col_precio, col_total], repeatRows=1)
     tbl.setStyle(TableStyle([
-        # Bordes gruesos
         ("BOX", (0,0), (-1,-1), 1.4, colors.black),
-        ("INNERGRID", (0,0), (-1,-2), 0.9, colors.black),  # hasta la penúltima (evitamos duplicar línea del total)
-
-        # Cabecera
+        ("INNERGRID", (0,0), (-1,-2), 0.9, colors.black),
         ("BACKGROUND", (0,0), (-1,0), colors.white),
         ("LINEBELOW", (0,0), (-1,0), 1.4, colors.black),
-
-        # Alineaciones / paddings
         ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
         ("ALIGN",  (1,1), (1,-2), "CENTER"),
         ("LEFTPADDING", (0,0), (-1,-1), 6),
         ("RIGHTPADDING", (0,0), (-1,-1), 6),
         ("TOPPADDING", (0,0), (-1,-1), 4),
         ("BOTTOMPADDING", (0,0), (-1,-1), 4),
-
-        # ---- Estilos de la fila TOTAL ----
-        ("SPAN", (0, idx_total), (2, idx_total)),                # "Total Final:" ocupa columnas 0..2
-        ("LINEABOVE", (0, idx_total), (-1, idx_total), 1.6, colors.black),  # línea gruesa sobre el total
+        ("SPAN", (0, idx_total), (2, idx_total)),
+        ("LINEABOVE", (0, idx_total), (-1, idx_total), 1.6, colors.black),
         ("ALIGN", (0, idx_total), (2, idx_total), "CENTER"),
         ("RIGHTPADDING", (3, idx_total), (3, idx_total), 6),
     ]))
