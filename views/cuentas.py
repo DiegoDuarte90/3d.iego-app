@@ -33,9 +33,21 @@ CREATE TABLE IF NOT EXISTS payment_splits (
 );
 CREATE INDEX IF NOT EXISTS idx_payment_splits_mov ON payment_splits(mov_id);
 """
-def _ensure_table():
+
+DDL_EXPENSES = """
+CREATE TABLE IF NOT EXISTS expenses (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  fecha      TEXT    NOT NULL,   -- YYYY-MM-DD
+  concepto   TEXT    NOT NULL,
+  monto      REAL    NOT NULL,
+  created_at TEXT    DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_expenses_fecha ON expenses(fecha);
+"""
+
+def _ensure_tables():
     with db.get_conn() as c:
-        c.executescript(DDL_SPLITS)
+        c.executescript(DDL_SPLITS + DDL_EXPENSES)
 
 def _month_bounds(yyyy_mm: str):
     d0 = datetime.strptime(yyyy_mm + "-01", "%Y-%m-%d")
@@ -97,31 +109,71 @@ def _update_split(split_id: int, amount: float, divisor: int, mark: bool):
             (float(amount), int(divisor), 1 if mark else 0, int(split_id))
         )
 
+# ---------- Gastos ----------
+def _add_expense(fecha: str, concepto: str, monto: float):
+    with db.get_conn() as c:
+        c.execute("INSERT INTO expenses(fecha, concepto, monto) VALUES (?,?,?)",
+                  (fecha, concepto.strip(), float(monto)))
+
+def _del_expense(exp_id: int):
+    with db.get_conn() as c:
+        c.execute("DELETE FROM expenses WHERE id=?", (int(exp_id),))
+
+def _get_expenses(ini: str, fin: str):
+    with db.get_conn() as c:
+        rows = c.execute(
+            "SELECT id, fecha, concepto, monto FROM expenses WHERE date(fecha) BETWEEN ? AND ? ORDER BY fecha DESC, id DESC",
+            (ini, fin)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+def _totals_from_splits(ini: str, fin: str):
+    """Devuelve (ganancia_bruta, ganancia_media_total, ganancia_media_pendiente)."""
+    with db.get_conn() as c:
+        rows = c.execute("""
+            SELECT s.part_amount AS amt, s.cost_divisor AS div, s.mark_paid AS paid
+            FROM payment_splits s
+            JOIN movimientos m ON m.id = s.mov_id
+            WHERE m.tipo='pago' AND date(m.fecha) BETWEEN ? AND ?
+        """, (ini, fin)).fetchall()
+    gan_total = D(0)
+    gm_total  = D(0)
+    gm_pend   = D(0)
+    for r in rows:
+        amt = D(r["amt"]); div = D(int(r["div"]) if int(r["div"]) else 1)
+        gan = amt - (amt / div)
+        gm  = gan / D(2)
+        gan_total += gan
+        gm_total  += gm
+        if int(r["paid"]) == 0:
+            gm_pend += gm
+    return gan_total, gm_total, gm_pend
+
 # ---------- UI ----------
 def render():
-    _ensure_table()
+    _ensure_tables()
 
-    # CSS ULTRA COMPACTO
+    # CSS (compacto)
     st.markdown("""
     <style>
       .block-container{padding-top:.3rem;padding-bottom:.5rem}
-      h1{margin:.1rem 0 .4rem!important}
-      h2,h3{margin:.2rem 0 .35rem!important}
+      h1{margin:.1rem 0 .4rem!important} h2,h3{margin:.2rem 0 .35rem!important}
       [data-testid="stExpander"]{margin:.25rem 0;border-radius:.5rem;border:1px solid #2a2f3a}
       [data-testid="stExpander"] details>summary{padding:.2rem .45rem;font-size:.9rem}
-      div[data-testid="stHorizontalBlock"]{gap:.2rem!important}
-      div[data-testid="column"]{padding:0 .12rem}
-      .stNumberInput, .stSelectbox, .stCheckbox{margin-bottom:.08rem}
-      .stNumberInput input{padding:.12rem .35rem;height:24px;font-size:12px}
-      div[data-baseweb="select"]>div{min-height:24px}
-      div[data-baseweb="select"] *{font-size:12px}
-      [data-testid="stCheckbox"] label{font-size:12px}
-      button[kind]{min-height:24px!important;padding:.08rem .45rem!important;font-size:12px!important}
-      .mini{font-size:.85rem;background:#12151c;border:1px solid #272b35;border-radius:.35rem;
-            padding:.15rem .35rem;text-align:center;white-space:nowrap}
-      .head{font-size:.7rem;color:#9aa;letter-spacing:.04em;text-transform:uppercase;margin:.1rem 0 .15rem}
+      div[data-testid="stHorizontalBlock"]{gap:.2rem!important} div[data-testid="column"]{padding:0 .12rem}
+      .stNumberInput, .stSelectbox, .stCheckbox, .stTextInput, .stDateInput{margin-bottom:.08rem}
+      .stNumberInput input, .stTextInput input{padding:.12rem .35rem;height:24px;font-size:12px}
+      div[data-baseweb="select"]>div{min-height:24px} div[data-baseweb="select"] *{font-size:12px}
+      [data-testid="stCheckbox"] label{font-size:12px} button[kind]{min-height:24px!important;padding:.08rem .45rem!important;font-size:12px!important}
+      .mini{font-size:.85rem;background:#12151c;border:1px solid #272b35;border-radius:.35rem;padding:.15rem .35rem;text-align:center;white-space:nowrap}
       .sep{border-top:1px solid #252a33;margin:.35rem 0}
       .warn{background:#3a3205;border:1px solid #7a650c;padding:.2rem .4rem;border-radius:.35rem;font-size:.8rem}
+      .kpicard{background:#0f1117;border:1px solid #2a2f3a;border-radius:.6rem;padding:.4rem .6rem}
+      .kpititle{font-size:.72rem;color:#9aa;text-transform:uppercase;letter-spacing:.05em}
+      .kpiv{font-size:1rem;font-weight:600}
+      .muted{color:#9aa;font-size:.8rem}
+      .pill{display:inline-block;border:1px solid #2a2f3a;border-radius:.6rem;padding:.15rem .4rem}
+      .lbl{font-size:.65rem;color:#9aa;text-transform:uppercase;letter-spacing:.05em;margin-bottom:.1rem}
     </style>
     """, unsafe_allow_html=True)
 
@@ -131,13 +183,63 @@ def render():
     mes_sel = st.selectbox("Mes", meses, index=0)
     ini, fin = _month_bounds(mes_sel)
 
+    # ---- Resumen del mes (ventas + gastos) ----
+    gan_total, gm_total, gm_pend = _totals_from_splits(ini, fin)
+    expenses = _get_expenses(ini, fin)
+    gastos_total = D(sum(float(e["monto"]) for e in expenses))
+    gan_neta = gan_total - gastos_total
+
+    # Individual (pendiente) = GM no pagado - gastos/2 (compartidos)
+    individual_pend = gm_pend - (gastos_total / D(2))
+    if individual_pend < D(0):
+        individual_pend = D(0)
+
+    cA, cB, cC, cD = st.columns([1.1, 1.1, 1.0, 1.1])
+    with cA:
+        st.markdown("<div class='kpicard'><div class='kpititle'>Ganancia individual (pendiente)</div>"
+                    f"<div class='kpiv'>{money(individual_pend)}</div></div>", unsafe_allow_html=True)
+
+    with cB:
+        st.markdown("<div class='kpicard'><div class='kpititle'>Ganancia bruta</div>"
+                    f"<div class='kpiv'>{money(gan_total)}</div></div>", unsafe_allow_html=True)
+    with cC:
+        st.markdown("<div class='kpicard'><div class='kpititle'>Gastos del mes</div>"
+                    f"<div class='kpiv'>{money(gastos_total)}</div></div>", unsafe_allow_html=True)
+    with cD:
+        st.markdown("<div class='kpicard'><div class='kpititle'>Ganancia neta</div>"
+                    f"<div class='kpiv'>{money(gan_neta)}</div></div>", unsafe_allow_html=True)
+
+    # ---- Carga y listado de GASTOS (del mes) ----
+    with st.expander("Gastos del mes", expanded=False):
+        g1, g2, g3, g4 = st.columns([.8, 2.0, .9, .7])
+        g1.caption("FECHA"); g2.caption("CONCEPTO"); g3.caption("MONTO")
+        fecha_g = g1.date_input("Fecha", value=date.today(), format="YYYY-MM-DD", label_visibility="collapsed")
+        concepto_g = g2.text_input("Concepto", value="", placeholder="Detalle del gasto", label_visibility="collapsed")
+        monto_g = g3.number_input("Monto", min_value=0.0, step=100.0, value=0.0, label_visibility="collapsed")
+        if g4.button("➕ Agregar", key="add_exp"):
+            if concepto_g and float(monto_g) > 0:
+                _add_expense(fecha_g.strftime("%Y-%m-%d"), concepto_g, float(monto_g))
+                st.rerun()
+
+        if expenses:
+            st.markdown("<span class='muted'>Listado</span>", unsafe_allow_html=True)
+            for e in expenses:
+                c1, c2, c3, c4 = st.columns([.9, 2.2, .9, .6])
+                c1.markdown(f"<div class='pill'>{e['fecha']}</div>", unsafe_allow_html=True)
+                c2.write(e["concepto"])
+                c3.markdown(f"<div class='mini'>{money(e['monto'])}</div>", unsafe_allow_html=True)
+                if c4.button("🗑", key=f"del_exp_{e['id']}"):
+                    _del_expense(e["id"]); st.rerun()
+        else:
+            st.caption("Sin gastos cargados en este mes.")
+
+    # ---- Pagos del mes ----
     pagos = _fetch_pagos(ini, fin)
     if not pagos:
         st.info("Sin pagos en este mes.")
         return
 
     st.subheader("Pagos del mes")
-    total_gan = D(0); total_gm = D(0)
 
     for idx, p in enumerate(pagos, start=1):
         pid   = int(p["id"])
@@ -148,12 +250,18 @@ def render():
         partes = _get_splits(pid)
 
         with st.expander("Partes / Ajustes", expanded=True):
-            st.markdown("<div class='head'>Monto · Div · Costo · Gan · GM · Pago · Acc.</div>", unsafe_allow_html=True)
-
-            # FILA ULTRA COMPACTA POR PARTE (7 columnas)
+            # FILA ULTRA COMPACTA POR PARTE (7 columnas) + etiquetas encima de cada cifra
             for s in partes:
                 sid = int(s["id"])
                 c1, c2, c3, c4, c5, c6, c7 = st.columns([1.05,.7,.7,.7,.7,.5,.5])
+
+                c1.markdown("<div class='lbl'>MONTO</div>", unsafe_allow_html=True)
+                c2.markdown("<div class='lbl'>DIV</div>", unsafe_allow_html=True)
+                c3.markdown("<div class='lbl'>COSTO</div>", unsafe_allow_html=True)
+                c4.markdown("<div class='lbl'>GAN</div>", unsafe_allow_html=True)
+                c5.markdown("<div class='lbl'>GM</div>", unsafe_allow_html=True)
+                c6.markdown("<div class='lbl'>PAGO</div>", unsafe_allow_html=True)
+                c7.markdown("<div class='lbl'>ACC.</div>", unsafe_allow_html=True)
 
                 amt = c1.number_input("Monto", min_value=0.0, step=100.0,
                                       value=float(s["part_amount"]), key=f"pa_{sid}", label_visibility="collapsed")
@@ -173,9 +281,7 @@ def render():
                 if c7.button("🗑", key=f"del_{sid}"):
                     _delete_split(sid); st.rerun()
 
-                total_gan += gan; total_gm += gm
-
-            # Suma visible + warning MINI
+            # Suma visible + warning
             sum_ui = 0.0
             for s in partes:
                 sid = int(s["id"])
@@ -189,7 +295,7 @@ def render():
             else:
                 st.caption(f"✔️ Suma OK ({money(sum_ui)}).")
 
-            # Barra compacta de acciones por pago (SIN autocuadrar)
+            # Acciones
             b1, b2 = st.columns([.9, .9])
             if b1.button("💾 Guardar", key=f"save_{pid}"):
                 for s in partes:
@@ -211,34 +317,8 @@ def render():
 
         st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
-    # Totales súper compactos
+    # ---- Totales del mes (netos) ----
     st.subheader("Totales del mes")
-    c1, c2 = st.columns(2)
-    c1.write(f"**Ganancia:** {money(total_gan)}")
-    c2.write(f"**Ganancia media:** {money(total_gm)}")
-
-    # Totales por método (opcional)
-    with db.get_conn() as c:
-        df = pd.read_sql_query(
-            """
-            SELECT s.part_amount,
-                   (s.part_amount / NULLIF(s.cost_divisor,0)) AS costo,
-                   (s.part_amount - (s.part_amount/NULLIF(s.cost_divisor,0))) AS ganancia,
-                   m.medio_pago
-            FROM payment_splits s
-            JOIN movimientos m ON m.id = s.mov_id
-            WHERE m.tipo='pago' AND date(m.fecha) BETWEEN ? AND ?
-            """,
-            c, params=[ini, fin]
-        )
-    if not df.empty:
-        df["ganancia_media"] = df["ganancia"] / 2.0
-        st.caption("Por método")
-        st.dataframe(
-            df.groupby(df["medio_pago"].fillna("—"))[
-                ["part_amount","costo","ganancia","ganancia_media"]
-            ].sum().round(0).rename(columns={
-                "part_amount":"MONTO","costo":"COSTO","ganancia":"GANANCIA","ganancia_media":"GAN. MEDIA"
-            }),
-            width="stretch"
-        )
+    c1, c2, c3 = st.columns(3)
+    c1.write(f"**Ganancia bruta:** {money(gan_total)}")
+    c2.writ
