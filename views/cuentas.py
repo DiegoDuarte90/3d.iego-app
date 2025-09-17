@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS payment_splits (
   mov_id       INTEGER NOT NULL,
   part_amount  REAL    NOT NULL,
   cost_divisor INTEGER NOT NULL DEFAULT 1,
-  mark_paid    INTEGER NOT NULL DEFAULT 0,
+  mark_paid    INTEGER NOT NULL DEFAULT 0, -- compatibilidad; no se usa en UI
   created_at   TEXT    DEFAULT (datetime('now')),
   updated_at   TEXT    DEFAULT (datetime('now')),
   FOREIGN KEY (mov_id) REFERENCES movimientos(id) ON DELETE CASCADE
@@ -45,9 +45,21 @@ CREATE TABLE IF NOT EXISTS expenses (
 CREATE INDEX IF NOT EXISTS idx_expenses_fecha ON expenses(fecha);
 """
 
+# Libro de pagos a Romina
+DDL_PAYOUTS = """
+CREATE TABLE IF NOT EXISTS partner_payouts (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  fecha      TEXT    NOT NULL,   -- YYYY-MM-DD
+  monto      REAL    NOT NULL,
+  nota       TEXT,
+  created_at TEXT    DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_partner_payouts_fecha ON partner_payouts(fecha);
+"""
+
 def _ensure_tables():
     with db.get_conn() as c:
-        c.executescript(DDL_SPLITS + DDL_EXPENSES)
+        c.executescript(DDL_SPLITS + DDL_EXPENSES + DDL_PAYOUTS)
 
 def _month_bounds(yyyy_mm: str):
     d0 = datetime.strptime(yyyy_mm + "-01", "%Y-%m-%d")
@@ -78,7 +90,7 @@ def _get_splits(mov_id: int):
             "SELECT id, mov_id, part_amount, cost_divisor, mark_paid FROM payment_splits WHERE mov_id=? ORDER BY id",
             (mov_id,)
         ).fetchall()
-        return [dict(r) for r in rows]
+    return [dict(r) for r in rows]
 
 def _ensure_default_split(mov_id: int, monto: float):
     with db.get_conn() as c:
@@ -100,13 +112,13 @@ def _delete_split(split_id: int):
     with db.get_conn() as c:
         c.execute("DELETE FROM payment_splits WHERE id=?", (split_id,))
 
-def _update_split(split_id: int, amount: float, divisor: int, mark: bool):
+def _update_split(split_id: int, amount: float, divisor: int):
     with db.get_conn() as c:
         c.execute(
             """UPDATE payment_splits
-               SET part_amount=?, cost_divisor=?, mark_paid=?, updated_at=datetime('now')
+               SET part_amount=?, cost_divisor=?, updated_at=datetime('now')
                WHERE id=?""",
-            (float(amount), int(divisor), 1 if mark else 0, int(split_id))
+            (float(amount), int(divisor), int(split_id))
         )
 
 # ---------- Gastos ----------
@@ -127,89 +139,153 @@ def _get_expenses(ini: str, fin: str):
         ).fetchall()
         return [dict(r) for r in rows]
 
+# ---------- Pagos a Romina ----------
+def _add_payout(fecha: str, monto: float, nota: str | None):
+    with db.get_conn() as c:
+        c.execute("INSERT INTO partner_payouts(fecha, monto, nota) VALUES (?,?,?)",
+                  (fecha, float(monto), (nota or "").strip()))
+
+def _update_payout(pid: int, fecha: str, monto: float, nota: str | None):
+    with db.get_conn() as c:
+        c.execute("UPDATE partner_payouts SET fecha=?, monto=?, nota=? WHERE id=?",
+                  (fecha, float(monto), (nota or "").strip(), int(pid)))
+
+def _del_payout(pid: int):
+    with db.get_conn() as c:
+        c.execute("DELETE FROM partner_payouts WHERE id=?", (int(pid),))
+
+def _get_payouts(ini: str, fin: str):
+    with db.get_conn() as c:
+        rows = c.execute(
+            "SELECT id, fecha, monto, nota FROM partner_payouts WHERE date(fecha) BETWEEN ? AND ? ORDER BY fecha DESC, id DESC",
+            (ini, fin)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+# ---------- Totales desde splits ----------
 def _totals_from_splits(ini: str, fin: str):
-    """Devuelve (ganancia_bruta, ganancia_media_total, ganancia_media_pendiente)."""
+    """Devuelve (ganancia_bruta, ganancia_media_total)."""
     with db.get_conn() as c:
         rows = c.execute("""
-            SELECT s.part_amount AS amt, s.cost_divisor AS div, s.mark_paid AS paid
+            SELECT s.part_amount AS amt, s.cost_divisor AS div
             FROM payment_splits s
             JOIN movimientos m ON m.id = s.mov_id
             WHERE m.tipo='pago' AND date(m.fecha) BETWEEN ? AND ?
         """, (ini, fin)).fetchall()
     gan_total = D(0)
     gm_total  = D(0)
-    gm_pend   = D(0)
     for r in rows:
         amt = D(r["amt"]); div = D(int(r["div"]) if int(r["div"]) else 1)
-        gan = amt - (amt / div)
-        gm  = gan / D(2)
+        costo = amt / div
+        gan   = amt - costo
+        gm    = gan / D(2)
         gan_total += gan
         gm_total  += gm
-        if int(r["paid"]) == 0:
-            gm_pend += gm
-    return gan_total, gm_total, gm_pend
+    return gan_total, gm_total
 
 # ---------- UI ----------
 def render():
     _ensure_tables()
 
-    # CSS (compacto)
+    # CSS compacto
     st.markdown("""
     <style>
       .block-container{padding-top:.3rem;padding-bottom:.5rem}
       h1{margin:.1rem 0 .4rem!important} h2,h3{margin:.2rem 0 .35rem!important}
       [data-testid="stExpander"]{margin:.25rem 0;border-radius:.5rem;border:1px solid #2a2f3a}
-      [data-testid="stExpander"] details>summary{padding:.2rem .45rem;font-size:.9rem}
       div[data-testid="stHorizontalBlock"]{gap:.2rem!important} div[data-testid="column"]{padding:0 .12rem}
-      .stNumberInput, .stSelectbox, .stCheckbox, .stTextInput, .stDateInput{margin-bottom:.08rem}
       .stNumberInput input, .stTextInput input{padding:.12rem .35rem;height:24px;font-size:12px}
-      div[data-baseweb="select"]>div{min-height:24px} div[data-baseweb="select"] *{font-size:12px}
-      [data-testid="stCheckbox"] label{font-size:12px} button[kind]{min-height:24px!important;padding:.08rem .45rem!important;font-size:12px!important}
+      button[kind]{min-height:24px!important;padding:.08rem .45rem!important;font-size:12px!important}
       .mini{font-size:.85rem;background:#12151c;border:1px solid #272b35;border-radius:.35rem;padding:.15rem .35rem;text-align:center;white-space:nowrap}
       .sep{border-top:1px solid #252a33;margin:.35rem 0}
       .warn{background:#3a3205;border:1px solid #7a650c;padding:.2rem .4rem;border-radius:.35rem;font-size:.8rem}
-      .kpicard{background:#0f1117;border:1px solid #2a2f3a;border-radius:.6rem;padding:.4rem .6rem}
+      .kpicard{background:#0f1117;border:1px solid #2a2f3a;border-radius:.6rem;padding:.5rem .6rem}
       .kpititle{font-size:.72rem;color:#9aa;text-transform:uppercase;letter-spacing:.05em}
       .kpiv{font-size:1rem;font-weight:600}
       .muted{color:#9aa;font-size:.8rem}
       .pill{display:inline-block;border:1px solid #2a2f3a;border-radius:.6rem;padding:.15rem .4rem}
       .lbl{font-size:.65rem;color:#9aa;text-transform:uppercase;letter-spacing:.05em;margin-bottom:.1rem}
+      .neg{color:#ff4d4f}
+      #overlay{ position:fixed; z-index:10050; inset:0; background:rgba(0,0,0,.55); }
+      #modal{
+        position:fixed; z-index:10060; left:50%; top:50%;
+        transform:translate(-50%,-50%); width:min(820px, 94vw); max-height:80vh; overflow:auto;
+        background:#11151a; border:1px solid rgba(255,255,255,.15); border-radius:12px; padding:16px;
+      }
     </style>
     """, unsafe_allow_html=True)
 
     st.title("Cuentas")
 
+    # Estado UI
+    ss = st.session_state
+    ss.setdefault("show_payout_modal", False)
+    ss.setdefault("payout_edit_id", None)
+    ss.setdefault("_payout_edit_fecha", None)
+    ss.setdefault("_payout_edit_monto", None)
+    ss.setdefault("_payout_edit_nota", "")
+
     meses = _available_months()
     mes_sel = st.selectbox("Mes", meses, index=0)
     ini, fin = _month_bounds(mes_sel)
 
-    # ---- Resumen del mes (ventas + gastos) ----
-    gan_total, gm_total, gm_pend = _totals_from_splits(ini, fin)
+    # ---- Totales (ventas + gastos) ----
+    gan_total, gm_total = _totals_from_splits(ini, fin)
     expenses = _get_expenses(ini, fin)
     gastos_total = D(sum(float(e["monto"]) for e in expenses))
-    gan_neta = gan_total - gastos_total
 
-    # Individual (pendiente) = GM no pagado - gastos/2 (compartidos)
-    individual_pend = gm_pend - (gastos_total / D(2))
-    if individual_pend < D(0):
-        individual_pend = D(0)
+    # Pagos a Romina del mes
+    payouts = _get_payouts(ini, fin)
+    payouts_total = D(sum(float(p["monto"]) for p in payouts))
 
-    cA, cB, cC, cD = st.columns([1.1, 1.1, 1.0, 1.1])
+    # KPI: Ganancia individual (mes)
+    gan_individual = gm_total - (gastos_total / D(2))
+    # KPI: Pago a Romina (mes)
+    pago_a_romina = gan_individual - payouts_total
+
+    # ---- KPIs ----
+    cA, cB, cC, cD = st.columns([1.35, 1.25, 1.0, 1.1])
+
     with cA:
-        st.markdown("<div class='kpicard'><div class='kpititle'>Ganancia individual (pendiente)</div>"
-                    f"<div class='kpiv'>{money(individual_pend)}</div></div>", unsafe_allow_html=True)
+        color_cls = "kpiv neg" if pago_a_romina > D(0) else "kpiv"
+        st.markdown(
+            "<div class='kpicard'>"
+            "<div class='kpititle'>Pago a Romina (mes)</div>"
+            f"<div class='{color_cls}'>{money(pago_a_romina)}</div>"
+            "<div class='muted'>= Ganancia individual − pagos registrados</div>",
+            unsafe_allow_html=True
+        )
+        if st.button("🔎 Gestionar pagos", key="btn_open_payout_dialog"):
+            ss.show_payout_modal = True
+            ss.payout_edit_id = None
 
     with cB:
-        st.markdown("<div class='kpicard'><div class='kpititle'>Ganancia bruta</div>"
-                    f"<div class='kpiv'>{money(gan_total)}</div></div>", unsafe_allow_html=True)
-    with cC:
-        st.markdown("<div class='kpicard'><div class='kpititle'>Gastos del mes</div>"
-                    f"<div class='kpiv'>{money(gastos_total)}</div></div>", unsafe_allow_html=True)
-    with cD:
-        st.markdown("<div class='kpicard'><div class='kpititle'>Ganancia neta</div>"
-                    f"<div class='kpiv'>{money(gan_neta)}</div></div>", unsafe_allow_html=True)
+        color_cls = "kpiv neg" if gan_individual < D(0) else "kpiv"
+        st.markdown(
+            "<div class='kpicard'>"
+            "<div class='kpititle'>Ganancia individual (mes)</div>"
+            f"<div class='{color_cls}'>{money(gan_individual)}</div>"
+            "<div class='muted'>= GM mes − gastos/2</div>"
+            "</div>",
+            unsafe_allow_html=True
+        )
 
-    # ---- Carga y listado de GASTOS (del mes) ----
+    with cC:
+        st.markdown(
+            "<div class='kpicard'><div class='kpititle'>Gastos del mes</div>"
+            f"<div class='kpiv'>{money(gastos_total)}</div></div>",
+            unsafe_allow_html=True
+        )
+
+    with cD:
+        gan_neta_mes = gan_total - gastos_total
+        st.markdown(
+            "<div class='kpicard'><div class='kpititle'>Ganancia neta (global)</div>"
+            f"<div class='kpiv'>{money(gan_neta_mes)}</div></div>",
+            unsafe_allow_html=True
+        )
+
+    # ---- GASTOS del mes ----
     with st.expander("Gastos del mes", expanded=False):
         g1, g2, g3, g4 = st.columns([.8, 2.0, .9, .7])
         g1.caption("FECHA"); g2.caption("CONCEPTO"); g3.caption("MONTO")
@@ -233,14 +309,14 @@ def render():
         else:
             st.caption("Sin gastos cargados en este mes.")
 
-    # ---- Pagos del mes ----
+    # ---- Pagos del mes (ventas) ----
     pagos = _fetch_pagos(ini, fin)
     if not pagos:
         st.info("Sin pagos en este mes.")
+        _maybe_open_payout_dialog(ini, fin)  # por si quedó abierto
         return
 
     st.subheader("Pagos del mes")
-
     for idx, p in enumerate(pagos, start=1):
         pid   = int(p["id"])
         monto = D(p["monto"])
@@ -250,18 +326,16 @@ def render():
         partes = _get_splits(pid)
 
         with st.expander("Partes / Ajustes", expanded=True):
-            # FILA ULTRA COMPACTA POR PARTE (7 columnas) + etiquetas encima de cada cifra
             for s in partes:
                 sid = int(s["id"])
-                c1, c2, c3, c4, c5, c6, c7 = st.columns([1.05,.7,.7,.7,.7,.5,.5])
+                c1, c2, c3, c4, c5, c6 = st.columns([1.05,.7,.7,.7,.6,.6])
 
                 c1.markdown("<div class='lbl'>MONTO</div>", unsafe_allow_html=True)
                 c2.markdown("<div class='lbl'>DIV</div>", unsafe_allow_html=True)
                 c3.markdown("<div class='lbl'>COSTO</div>", unsafe_allow_html=True)
                 c4.markdown("<div class='lbl'>GAN</div>", unsafe_allow_html=True)
                 c5.markdown("<div class='lbl'>GM</div>", unsafe_allow_html=True)
-                c6.markdown("<div class='lbl'>PAGO</div>", unsafe_allow_html=True)
-                c7.markdown("<div class='lbl'>ACC.</div>", unsafe_allow_html=True)
+                c6.markdown("<div class='lbl'>ACC.</div>", unsafe_allow_html=True)
 
                 amt = c1.number_input("Monto", min_value=0.0, step=100.0,
                                       value=float(s["part_amount"]), key=f"pa_{sid}", label_visibility="collapsed")
@@ -277,8 +351,7 @@ def render():
                 c4.markdown(f"<div class='mini'>{money(gan)}</div>",   unsafe_allow_html=True)
                 c5.markdown(f"<div class='mini'>{money(gm)}</div>",    unsafe_allow_html=True)
 
-                c6.checkbox("Pago", value=bool(s["mark_paid"]), key=f"mk_{sid}", label_visibility="collapsed")
-                if c7.button("🗑", key=f"del_{sid}"):
+                if c6.button("🗑", key=f"del_{sid}"):
                     _delete_split(sid); st.rerun()
 
             # Suma visible + warning
@@ -302,13 +375,11 @@ def render():
                     sid = int(s["id"])
                     amt = float(st.session_state.get(f"pa_{sid}", s["part_amount"]))
                     div = int(st.session_state.get(f"dv_{sid}", s["cost_divisor"]))
-                    mk  = bool(st.session_state.get(f"mk_{sid}", s["mark_paid"]))
-                    _update_split(sid, amt, div, mk)
+                    _update_split(sid, amt, div)
                 for s in partes:
                     sid = int(s["id"])
                     st.session_state.pop(f"pa_{sid}", None)
                     st.session_state.pop(f"dv_{sid}", None)
-                    st.session_state.pop(f"mk_{sid}", None)
                 st.rerun()
 
             if b2.button("➕ Parte", key=f"add_{pid}"):
@@ -317,8 +388,104 @@ def render():
 
         st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
-    # ---- Totales del mes (netos) ----
+    # ---- Totales del mes (resumen textual) ----
     st.subheader("Totales del mes")
-    c1, c2, c3 = st.columns(3)
-    c1.write(f"**Ganancia bruta:** {money(gan_total)}")
-    c2.writ
+    c1, c2, c3, c4 = st.columns([1.1, 1.1, 1.1, 1.1])
+    c1.write(f"**Ganancia bruta (global):** {money(gan_total)}")
+    c2.write(f"**Gastos del mes (global):** {money(gastos_total)}")
+    c3.write(f"**Ganancia individual (mes):** {money(gan_individual)}")
+    c4.write(f"**Pago a Romina (mes):** {money(pago_a_romina)}")
+
+    _maybe_open_payout_dialog(ini, fin)  # popup si está abierto
+
+
+# ====================== Popup "lupa" pagos Romina ======================
+
+def _maybe_open_payout_dialog(ini: str, fin: str):
+    ss = st.session_state
+    if not ss.get("show_payout_modal"):
+        return
+    try:
+        dialog = getattr(st, "dialog")
+    except AttributeError:
+        dialog = None
+
+    if dialog:
+        @dialog("Pagos a Romina")
+        def _dlg():
+            _render_payout_dialog_content(ini, fin)
+        _dlg()
+    else:
+        st.markdown("<div id='overlay'></div><div id='modal'><h4>Pagos a Romina</h4></div>", unsafe_allow_html=True)
+        _render_payout_dialog_content(ini, fin)
+
+
+def _render_payout_dialog_content(ini: str, fin: str):
+    ss = st.session_state
+
+    # Form alta/edición — Monto (foco inicial), Nota, y Fecha al final (default hoy)
+    with st.form("payout_form", clear_on_submit=False):
+        monto_val = st.number_input("Monto", min_value=0.0, step=100.0,
+                                    value=(ss.get("_payout_edit_monto", 0.0) if ss.get("payout_edit_id") else 0.0))
+        nota_val  = st.text_input("Nota (opcional)", value=(ss.get("_payout_edit_nota", "") if ss.get("payout_edit_id") else ""))
+        default_fecha = (ss.get("_payout_edit_fecha") or date.today())
+        fecha_val = st.date_input("Fecha", value=default_fecha, format="YYYY-MM-DD")  # no se abre solo
+
+        bcol1, bcol2, bcol3 = st.columns([.6, .2, .2])
+        ok = bcol1.form_submit_button("Guardar")
+        cancel = bcol2.form_submit_button("Cancelar")
+        if ok and float(monto_val) > 0:
+            if ss.get("payout_edit_id") is None:
+                _add_payout(fecha_val.strftime("%Y-%m-%d"), float(monto_val), nota_val)
+            else:
+                _update_payout(ss["payout_edit_id"], fecha_val.strftime("%Y-%m-%d"), float(monto_val), nota_val)
+            # limpiar estado y cerrar
+            ss.show_payout_modal = False
+            ss.payout_edit_id = None
+            ss._payout_edit_fecha = None
+            ss._payout_edit_monto = None
+            ss._payout_edit_nota  = ""
+            st.rerun()
+        if cancel:
+            ss.show_payout_modal = False
+            ss.payout_edit_id = None
+            ss._payout_edit_fecha = None
+            ss._payout_edit_monto = None
+            ss._payout_edit_nota  = ""
+            st.rerun()
+
+    st.markdown("---")
+    # Listado del mes (SOLO dentro del popup)
+    payouts = _get_payouts(ini, fin)
+    if not payouts:
+        st.info("Sin pagos registrados en este mes.")
+    else:
+        hdr = st.columns([.9, .9, 2.0, .7, .7])
+        hdr[0].markdown("**Fecha**"); hdr[1].markdown("**Monto**"); hdr[2].markdown("**Nota**")
+        hdr[3].markdown("**Editar**"); hdr[4].markdown("**Borrar**")
+        for e in payouts:
+            c1, c2, c3, c4, c5 = st.columns([.9, .9, 2.0, .7, .7])
+            c1.write(e["fecha"])
+            c2.write(money(e["monto"]))
+            c3.write(e.get("nota") or "—")
+            if c4.button("✏️", key=f"payout_edit_{e['id']}"):
+                ss.payout_edit_id = e["id"]
+                ss._payout_edit_fecha = datetime.strptime(e["fecha"], "%Y-%m-%d").date()
+                ss._payout_edit_monto = float(e["monto"])
+                ss._payout_edit_nota  = e.get("nota") or ""
+                st.rerun()
+            if c5.button("🗑", key=f"payout_del_{e['id']}"):
+                _del_payout(e["id"])
+                st.rerun()
+
+    # Cerrar (cuando no hay st.dialog, botón Cerrar)
+    try:
+        getattr(st, "dialog")
+    except AttributeError:
+        if st.button("Cerrar"):
+            ss.show_payout_modal = False
+            ss.payout_edit_id = None
+            ss._payout_edit_fecha = None
+            ss._payout_edit_monto = None
+            ss._payout_edit_nota  = ""
+            st.rerun()
