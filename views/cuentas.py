@@ -219,8 +219,7 @@ def render():
 
     # Estado UI
     ss = st.session_state
-    ss.setdefault("show_payout_modal", False)
-    ss.setdefault("payout_modal_armed", False)  # ← clave: solo se arma con la lupa
+    ss.setdefault("payout_open_once", False)  # ← abrir solo una vez por click
     ss.setdefault("payout_edit_id", None)
     ss.setdefault("_payout_edit_fecha", None)
     ss.setdefault("_payout_edit_monto", None)
@@ -256,10 +255,9 @@ def render():
             "<div class='muted'>= Ganancia individual − pagos registrados</div>",
             unsafe_allow_html=True
         )
-        # Solo arma y abre el modal al click
+        # Lupa: solo dispara apertura una vez
         if st.button("🔎", key="btn_open_payout_dialog"):
-            ss.show_payout_modal = True
-            ss.payout_modal_armed = True   # ← se arma acá
+            ss.payout_open_once = True
             ss.payout_edit_id = None
             st.rerun()
 
@@ -317,80 +315,80 @@ def render():
     pagos = _fetch_pagos(ini, fin)
     if not pagos:
         st.info("Sin pagos en este mes.")
-        _maybe_open_payout_dialog(ini, fin)  # por si quedó armado y abierto
-        return
+        # (No abrimos ningún popup automáticamente acá)
+        pass
+    else:
+        st.subheader("Pagos del mes")
+        for idx, p in enumerate(pagos, start=1):
+            pid   = int(p["id"])
+            monto = D(p["monto"])
+            st.markdown(f"**Pago #{idx}** — {p['fecha']} — {p['nombre']} — {money(monto)} — {p['medio_pago'] or '—'}")
 
-    st.subheader("Pagos del mes")
-    for idx, p in enumerate(pagos, start=1):
-        pid   = int(p["id"])
-        monto = D(p["monto"])
-        st.markdown(f"**Pago #{idx}** — {p['fecha']} — {p['nombre']} — {money(monto)} — {p['medio_pago'] or '—'}")
+            _ensure_default_split(pid, float(monto))
+            partes = _get_splits(pid)
 
-        _ensure_default_split(pid, float(monto))
-        partes = _get_splits(pid)
-
-        with st.expander("Partes / Ajustes", expanded=True):
-            for s in partes:
-                sid = int(s["id"])
-                c1, c2, c3, c4, c5, c6 = st.columns([1.05,.7,.7,.7,.6,.6])
-
-                c1.markdown("<div class='lbl'>MONTO</div>", unsafe_allow_html=True)
-                c2.markdown("<div class='lbl'>DIV</div>", unsafe_allow_html=True)
-                c3.markdown("<div class='lbl'>COSTO</div>", unsafe_allow_html=True)
-                c4.markdown("<div class='lbl'>GAN</div>", unsafe_allow_html=True)
-                c5.markdown("<div class='lbl'>GM</div>", unsafe_allow_html=True)
-                c6.markdown("<div class='lbl'>ACC.</div>", unsafe_allow_html=True)
-
-                amt = c1.number_input("Monto", min_value=0.0, step=100.0,
-                                      value=float(s["part_amount"]), key=f"pa_{sid}", label_visibility="collapsed")
-                div = c2.selectbox("Div", list(range(1,11)),
-                                   index=(int(s["cost_divisor"])-1 if 1<=int(s["cost_divisor"])<=10 else 0),
-                                   key=f"dv_{sid}", label_visibility="collapsed")
-
-                costo = D(amt) / D(div or 1)
-                gan   = D(amt) - costo
-                gm    = gan / D(2)
-
-                c3.markdown(f"<div class='mini'>{money(costo)}</div>", unsafe_allow_html=True)
-                c4.markdown(f"<div class='mini'>{money(gan)}</div>",   unsafe_allow_html=True)
-                c5.markdown(f"<div class='mini'>{money(gm)}</div>",    unsafe_allow_html=True)
-
-                if c6.button("🗑", key=f"del_{sid}"):
-                    _delete_split(sid); st.rerun()
-
-            # Suma visible + warning
-            sum_ui = 0.0
-            for s in partes:
-                sid = int(s["id"])
-                sum_ui += float(st.session_state.get(f"pa_{sid}", s["part_amount"]))
-            restante = float(monto) - sum_ui
-            if abs(restante) > 0.01:
-                st.markdown(
-                    f"<div class='warn'>⚠️ Suma {money(sum_ui)} ≠ Pago {money(monto)} (resta {money(restante)}).</div>",
-                    unsafe_allow_html=True
-                )
-            else:
-                st.caption(f"✔️ Suma OK ({money(sum_ui)}).")
-
-            # Acciones
-            b1, b2 = st.columns([.9, .9])
-            if b1.button("💾 Guardar", key=f"save_{pid}"):
+            with st.expander("Partes / Ajustes", expanded=True):
                 for s in partes:
                     sid = int(s["id"])
-                    amt = float(st.session_state.get(f"pa_{sid}", s["part_amount"]))
-                    div = int(st.session_state.get(f"dv_{sid}", s["cost_divisor"]))
-                    _update_split(sid, amt, div)
+                    c1, c2, c3, c4, c5, c6 = st.columns([1.05,.7,.7,.7,.6,.6])
+
+                    c1.markdown("<div class='lbl'>MONTO</div>", unsafe_allow_html=True)
+                    c2.markdown("<div class='lbl'>DIV</div>", unsafe_allow_html=True)
+                    c3.markdown("<div class='lbl'>COSTO</div>", unsafe_allow_html=True)
+                    c4.markdown("<div class='lbl'>GAN</div>", unsafe_allow_html=True)
+                    c5.markdown("<div class='lbl'>GM</div>", unsafe_allow_html=True)
+                    c6.markdown("<div class='lbl'>ACC.</div>", unsafe_allow_html=True)
+
+                    amt = c1.number_input("Monto", min_value=0.0, step=100.0,
+                                          value=float(s["part_amount"]), key=f"pa_{sid}", label_visibility="collapsed")
+                    div = c2.selectbox("Div", list(range(1,11)),
+                                       index=(int(s["cost_divisor"])-1 if 1<=int(s["cost_divisor"])<=10 else 0),
+                                       key=f"dv_{sid}", label_visibility="collapsed")
+
+                    costo = D(amt) / D(div or 1)
+                    gan   = D(amt) - costo
+                    gm    = gan / D(2)
+
+                    c3.markdown(f"<div class='mini'>{money(costo)}</div>", unsafe_allow_html=True)
+                    c4.markdown(f"<div class='mini'>{money(gan)}</div>",   unsafe_allow_html=True)
+                    c5.markdown(f"<div class='mini'>{money(gm)}</div>",    unsafe_allow_html=True)
+
+                    if c6.button("🗑", key=f"del_{sid}"):
+                        _delete_split(sid); st.rerun()
+
+                # Suma visible + warning
+                sum_ui = 0.0
                 for s in partes:
                     sid = int(s["id"])
-                    st.session_state.pop(f"pa_{sid}", None)
-                    st.session_state.pop(f"dv_{sid}", None)
-                st.rerun()
+                    sum_ui += float(st.session_state.get(f"pa_{sid}", s["part_amount"]))
+                restante = float(monto) - sum_ui
+                if abs(restante) > 0.01:
+                    st.markdown(
+                        f"<div class='warn'>⚠️ Suma {money(sum_ui)} ≠ Pago {money(monto)} (resta {money(restante)}).</div>",
+                        unsafe_allow_html=True
+                    )
+                else:
+                    st.caption(f"✔️ Suma OK ({money(sum_ui)}).")
 
-            if b2.button("➕ Parte", key=f"add_{pid}"):
-                _add_split(pid, max(0.0, float(monto) - sum_ui))
-                st.rerun()
+                # Acciones
+                b1, b2 = st.columns([.9, .9])
+                if b1.button("💾 Guardar", key=f"save_{pid}"):
+                    for s in partes:
+                        sid = int(s["id"])
+                        amt = float(st.session_state.get(f"pa_{sid}", s["part_amount"]))
+                        div = int(st.session_state.get(f"dv_{sid}", s["cost_divisor"]))
+                        _update_split(sid, amt, div)
+                    for s in partes:
+                        sid = int(s["id"])
+                        st.session_state.pop(f"pa_{sid}", None)
+                        st.session_state.pop(f"dv_{sid}", None)
+                    st.rerun()
 
-        st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
+                if b2.button("➕ Parte", key=f"add_{pid}"):
+                    _add_split(pid, max(0.0, float(monto) - sum_ui))
+                    st.rerun()
+
+            st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
     # ---- Totales del mes (resumen textual) ----
     st.subheader("Totales del mes")
@@ -400,7 +398,7 @@ def render():
     c3.write(f"**Ganancia individual (mes):** {money(gan_individual)}")
     c4.write(f"**Pago a Romina (mes):** {money(pago_a_romina)}")
 
-    # Render del popup SOLO si fue armado por la lupa
+    # Render del popup SOLO si fue pedido por click en esta corrida
     _maybe_open_payout_dialog(ini, fin)
 
 
@@ -408,8 +406,8 @@ def render():
 
 def _maybe_open_payout_dialog(ini: str, fin: str):
     ss = st.session_state
-    # ← condición estricta: solo renderiza si fue "armado" explícitamente por el botón
-    if not (ss.get("show_payout_modal") and ss.get("payout_modal_armed")):
+    # Solo abrir si se pidió explícitamente y una sola vez
+    if not ss.get("payout_open_once"):
         return
 
     try:
@@ -425,6 +423,9 @@ def _maybe_open_payout_dialog(ini: str, fin: str):
     else:
         st.markdown("<div id='overlay'></div><div id='modal'><h4>Pagos a Romina</h4></div>", unsafe_allow_html=True)
         _render_payout_dialog_content(ini, fin)
+
+    # ¡Clave! Evitar reabrir en próximos reruns si el usuario cierra con la X
+    ss.payout_open_once = False
 
 
 def _render_payout_dialog_content(ini: str, fin: str):
@@ -446,7 +447,6 @@ def _render_payout_dialog_content(ini: str, fin: str):
                 _add_payout(fecha_val.strftime("%Y-%m-%d"), float(monto_val), nota_val)
             else:
                 _update_payout(ss["payout_edit_id"], fecha_val.strftime("%Y-%m-%d"), float(monto_val), nota_val)
-            # limpiar estado y cerrar
             _close_payout_modal()
             st.rerun()
         if cancel:
@@ -472,9 +472,13 @@ def _render_payout_dialog_content(ini: str, fin: str):
                 ss._payout_edit_fecha = datetime.strptime(e["fecha"], "%Y-%m-%d").date()
                 ss._payout_edit_monto = float(e["monto"])
                 ss._payout_edit_nota  = e.get("nota") or ""
+                # reabrir una sola vez para editar
+                ss.payout_open_once = True
                 st.rerun()
             if c5.button("🗑", key=f"payout_del_{e['id']}"):
                 _del_payout(e["id"])
+                # reabrir una sola vez para ver el listado actualizado
+                ss.payout_open_once = True
                 st.rerun()
 
     # Cerrar (cuando no hay st.dialog, botón Cerrar)
@@ -487,11 +491,10 @@ def _render_payout_dialog_content(ini: str, fin: str):
 
 
 def _close_payout_modal():
-    """Resetea todas las flags del modal para que no vuelva a abrirse solo."""
+    """Limpia campos; no reabre el popup a menos que se presione la lupa."""
     ss = st.session_state
-    ss.show_payout_modal = False
-    ss.payout_modal_armed = False
     ss.payout_edit_id = None
     ss._payout_edit_fecha = None
     ss._payout_edit_monto = None
     ss._payout_edit_nota  = ""
+    ss.payout_open_once = False
