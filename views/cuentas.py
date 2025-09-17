@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS payment_splits (
   mov_id       INTEGER NOT NULL,
   part_amount  REAL    NOT NULL,
   cost_divisor INTEGER NOT NULL DEFAULT 1,
-  mark_paid    INTEGER NOT NULL DEFAULT 0, -- compatibilidad; no se usa en UI
+  mark_paid    INTEGER NOT NULL DEFAULT 0,
   created_at   TEXT    DEFAULT (datetime('now')),
   updated_at   TEXT    DEFAULT (datetime('now')),
   FOREIGN KEY (mov_id) REFERENCES movimientos(id) ON DELETE CASCADE
@@ -37,7 +37,7 @@ CREATE INDEX IF NOT EXISTS idx_payment_splits_mov ON payment_splits(mov_id);
 DDL_EXPENSES = """
 CREATE TABLE IF NOT EXISTS expenses (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  fecha      TEXT    NOT NULL,   -- YYYY-MM-DD
+  fecha      TEXT    NOT NULL,
   concepto   TEXT    NOT NULL,
   monto      REAL    NOT NULL,
   created_at TEXT    DEFAULT (datetime('now'))
@@ -45,11 +45,10 @@ CREATE TABLE IF NOT EXISTS expenses (
 CREATE INDEX IF NOT EXISTS idx_expenses_fecha ON expenses(fecha);
 """
 
-# Libro de pagos a Romina
 DDL_PAYOUTS = """
 CREATE TABLE IF NOT EXISTS partner_payouts (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  fecha      TEXT    NOT NULL,   -- YYYY-MM-DD
+  fecha      TEXT    NOT NULL,
   monto      REAL    NOT NULL,
   nota       TEXT,
   created_at TEXT    DEFAULT (datetime('now'))
@@ -57,9 +56,29 @@ CREATE TABLE IF NOT EXISTS partner_payouts (
 CREATE INDEX IF NOT EXISTS idx_partner_payouts_fecha ON partner_payouts(fecha);
 """
 
+# Guarda el nombre del cliente particular de un movimiento manual
+DDL_MANUAL_PAY_CLIENTS = """
+CREATE TABLE IF NOT EXISTS manual_pay_clients (
+  mov_id   INTEGER PRIMARY KEY,
+  cliente  TEXT
+);
+"""
+
 def _ensure_tables():
     with db.get_conn() as c:
-        c.executescript(DDL_SPLITS + DDL_EXPENSES + DDL_PAYOUTS)
+        c.executescript(DDL_SPLITS + DDL_EXPENSES + DDL_PAYOUTS + DDL_MANUAL_PAY_CLIENTS)
+
+# Revendedor "placeholder" para poder insertar en movimientos (rev_id NOT NULL)
+PARTICULARES_PLACEHOLDER = "Particulares (manual)"
+def _ensure_particular_rev_id() -> int:
+    with db.get_conn() as c:
+        row = c.execute("SELECT id FROM revendedores WHERE lower(nombre)=lower(?) LIMIT 1",
+                        (PARTICULARES_PLACEHOLDER,)).fetchone()
+        if row:
+            return int(row[0])
+        c.execute("INSERT INTO revendedores(nombre) VALUES (?)", (PARTICULARES_PLACEHOLDER,))
+        rid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+        return int(rid)
 
 def _month_bounds(yyyy_mm: str):
     d0 = datetime.strptime(yyyy_mm + "-01", "%Y-%m-%d")
@@ -76,9 +95,15 @@ def _available_months():
 def _fetch_pagos(ini, fin):
     with db.get_conn() as c:
         rows = c.execute("""
-            SELECT m.id, m.rev_id, m.fecha, m.monto, m.medio_pago, r.nombre
+            SELECT m.id,
+                   m.rev_id,
+                   m.fecha,
+                   m.monto,
+                   m.medio_pago,
+                   COALESCE(mc.cliente, r.nombre, 'Particular') AS nombre
             FROM movimientos m
-            JOIN revendedores r ON r.id = m.rev_id
+            LEFT JOIN revendedores r        ON r.id = m.rev_id
+            LEFT JOIN manual_pay_clients mc ON mc.mov_id = m.id
             WHERE m.tipo='pago' AND date(m.fecha) BETWEEN ? AND ?
             ORDER BY date(m.fecha) DESC, m.id DESC
         """, (ini, fin)).fetchall()
@@ -164,7 +189,6 @@ def _get_payouts(ini: str, fin: str):
 
 # ---------- Totales desde splits ----------
 def _totals_from_splits(ini: str, fin: str):
-    """Devuelve (ganancia_bruta, ganancia_media_total)."""
     with db.get_conn() as c:
         rows = c.execute("""
             SELECT s.part_amount AS amt, s.cost_divisor AS div
@@ -182,6 +206,27 @@ def _totals_from_splits(ini: str, fin: str):
         gan_total += gan
         gm_total  += gm
     return gan_total, gm_total
+
+# ---------- Pagos manuales (particulares) ----------
+def _add_manual_payment_particular(cliente: str, fecha_iso: str, monto: float, medio_pago: str):
+    """
+    Crea un movimiento 'pago' para un particular.
+    Como tu tabla movimientos tiene DETALLE NOT NULL, lo completo con 'Particular: {cliente}'.
+    """
+    rid = _ensure_particular_rev_id()
+    detalle_txt = f"Particular: {cliente.strip()}"
+    with db.get_conn() as c:
+        # NOTA: incluimos 'detalle' para satisfacer el NOT NULL constraint de tu esquema.
+        c.execute(
+            "INSERT INTO movimientos(rev_id, tipo, fecha, monto, medio_pago, detalle) VALUES (?,?,?,?,?,?)",
+            (rid, "pago", fecha_iso, float(monto), medio_pago, detalle_txt)
+        )
+        mov_id = int(c.execute("SELECT last_insert_rowid()").fetchone()[0])
+        c.execute(
+            "INSERT OR REPLACE INTO manual_pay_clients(mov_id, cliente) VALUES (?,?)",
+            (mov_id, cliente.strip())
+        )
+    return mov_id
 
 # ---------- UI ----------
 def render():
@@ -217,16 +262,16 @@ def render():
 
     st.title("Cuentas")
 
-    # Estado UI
+    # Estado UI Popup Romina
     ss = st.session_state
-    ss.setdefault("payout_open_once", False)  # ← abrir solo una vez por click
+    ss.setdefault("payout_open_once", False)
     ss.setdefault("payout_edit_id", None)
     ss.setdefault("_payout_edit_fecha", None)
     ss.setdefault("_payout_edit_monto", None)
     ss.setdefault("_payout_edit_nota", "")
 
     meses = _available_months()
-    mes_sel = st.selectbox("Mes", meses, index=0)
+    mes_sel = st.selectbox("Mes", meses, index=0, key="cuentas_sel_mes")
     ini, fin = _month_bounds(mes_sel)
 
     # ---- Totales (ventas + gastos) ----
@@ -255,7 +300,6 @@ def render():
             "<div class='muted'>= Ganancia individual − pagos registrados</div>",
             unsafe_allow_html=True
         )
-        # Lupa: solo dispara apertura una vez
         if st.button("🔎", key="btn_open_payout_dialog"):
             ss.payout_open_once = True
             ss.payout_edit_id = None
@@ -287,18 +331,49 @@ def render():
             unsafe_allow_html=True
         )
 
+    # ---- Agregar pago manual (solo particulares) ----
+    with st.expander("➕ Agregar pago manual", expanded=False):
+        cols = st.columns([2.0, 1.2, 1.0, 1.2])
+        cliente_part = cols[0].text_input("Cliente (particular)", value="", placeholder="Nombre del cliente", key="manual_pay_cliente")
+        fecha_manual = cols[1].date_input("Fecha", value=date.today(), format="YYYY-MM-DD", key="manual_pay_date")
+        monto_manual = cols[2].number_input("Monto", min_value=0.0, step=100.0, value=0.0, key="manual_pay_amount")
+        medio_manual = cols[3].selectbox("Medio de pago", ["MP", "Efectivo"], index=0, key="manual_pay_medio")
+
+        cacc1, cacc2 = st.columns([0.9, 0.9])
+        if cacc1.button("Guardar pago manual", key="save_manual_payment"):
+            if float(monto_manual) <= 0:
+                st.warning("Ingresá un monto mayor a 0.")
+            elif not (cliente_part or "").strip():
+                st.warning("Ingresá el nombre del cliente.")
+            else:
+                try:
+                    mov_id = _add_manual_payment_particular(
+                        cliente=cliente_part.strip(),
+                        fecha_iso=fecha_manual.strftime("%Y-%m-%d"),
+                        monto=float(monto_manual),
+                        medio_pago=medio_manual
+                    )
+                    _ensure_default_split(mov_id, float(monto_manual))
+                    st.success("Pago manual agregado.")
+                    st.rerun()
+                except Exception as e:
+                    st.warning(f"No se pudo agregar el pago: {e}")
+        if cacc2.button("Limpiar", key="clear_manual_payment"):
+            st.rerun()
+
     # ---- GASTOS del mes ----
     with st.expander("Gastos del mes", expanded=False):
         g1, g2, g3, g4 = st.columns([.8, 2.0, .9, .7])
         g1.caption("FECHA"); g2.caption("CONCEPTO"); g3.caption("MONTO")
-        fecha_g = g1.date_input("Fecha", value=date.today(), format="YYYY-MM-DD", label_visibility="collapsed")
-        concepto_g = g2.text_input("Concepto", value="", placeholder="Detalle del gasto", label_visibility="collapsed")
-        monto_g = g3.number_input("Monto", min_value=0.0, step=100.0, value=0.0, label_visibility="collapsed")
+        fecha_g = g1.date_input("Fecha", value=date.today(), format="YYYY-MM-DD", label_visibility="collapsed", key="expense_date")
+        concepto_g = g2.text_input("Concepto", value="", placeholder="Detalle del gasto", label_visibility="collapsed", key="expense_concept")
+        monto_g = g3.number_input("Monto", min_value=0.0, step=100.0, value=0.0, label_visibility="collapsed", key="expense_amount")
         if g4.button("➕ Agregar", key="add_exp"):
             if concepto_g and float(monto_g) > 0:
                 _add_expense(fecha_g.strftime("%Y-%m-%d"), concepto_g, float(monto_g))
                 st.rerun()
 
+        expenses = _get_expenses(ini, fin)
         if expenses:
             st.markdown("<span class='muted'>Listado</span>", unsafe_allow_html=True)
             for e in expenses:
@@ -311,12 +386,10 @@ def render():
         else:
             st.caption("Sin gastos cargados en este mes.")
 
-    # ---- Pagos del mes (ventas) ----
+    # ---- Pagos del mes ----
     pagos = _fetch_pagos(ini, fin)
     if not pagos:
         st.info("Sin pagos en este mes.")
-        # (No abrimos ningún popup automáticamente acá)
-        pass
     else:
         st.subheader("Pagos del mes")
         for idx, p in enumerate(pagos, start=1):
@@ -356,7 +429,6 @@ def render():
                     if c6.button("🗑", key=f"del_{sid}"):
                         _delete_split(sid); st.rerun()
 
-                # Suma visible + warning
                 sum_ui = 0.0
                 for s in partes:
                     sid = int(s["id"])
@@ -370,7 +442,6 @@ def render():
                 else:
                     st.caption(f"✔️ Suma OK ({money(sum_ui)}).")
 
-                # Acciones
                 b1, b2 = st.columns([.9, .9])
                 if b1.button("💾 Guardar", key=f"save_{pid}"):
                     for s in partes:
@@ -390,7 +461,6 @@ def render():
 
             st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
-    # ---- Totales del mes (resumen textual) ----
     st.subheader("Totales del mes")
     c1, c2, c3, c4 = st.columns([1.1, 1.1, 1.1, 1.1])
     c1.write(f"**Ganancia bruta (global):** {money(gan_total)}")
@@ -398,18 +468,14 @@ def render():
     c3.write(f"**Ganancia individual (mes):** {money(gan_individual)}")
     c4.write(f"**Pago a Romina (mes):** {money(pago_a_romina)}")
 
-    # Render del popup SOLO si fue pedido por click en esta corrida
     _maybe_open_payout_dialog(ini, fin)
-
 
 # ====================== Popup "lupa" pagos Romina ======================
 
 def _maybe_open_payout_dialog(ini: str, fin: str):
     ss = st.session_state
-    # Solo abrir si se pidió explícitamente y una sola vez
     if not ss.get("payout_open_once"):
         return
-
     try:
         dialog = getattr(st, "dialog")
     except AttributeError:
@@ -424,22 +490,28 @@ def _maybe_open_payout_dialog(ini: str, fin: str):
         st.markdown("<div id='overlay'></div><div id='modal'><h4>Pagos a Romina</h4></div>", unsafe_allow_html=True)
         _render_payout_dialog_content(ini, fin)
 
-    # ¡Clave! Evitar reabrir en próximos reruns si el usuario cierra con la X
     ss.payout_open_once = False
-
 
 def _render_payout_dialog_content(ini: str, fin: str):
     ss = st.session_state
-
-    # Form alta/edición — Monto (foco inicial), Nota, y Fecha al final (default hoy)
     with st.form("payout_form", clear_on_submit=False):
-        monto_val = st.number_input("Monto", min_value=0.0, step=100.0,
-                                    value=(ss.get("_payout_edit_monto", 0.0) if ss.get("payout_edit_id") else 0.0))
-        nota_val  = st.text_input("Nota (opcional)", value=(ss.get("_payout_edit_nota", "") if ss.get("payout_edit_id") else ""))
+        monto_val = st.number_input(
+            "Monto", min_value=0.0, step=100.0,
+            value=(ss.get("_payout_edit_monto", 0.0) if ss.get("payout_edit_id") else 0.0),
+            key=f"payout_amount_{ss.get('payout_edit_id') or 'new'}"
+        )
+        nota_val  = st.text_input(
+            "Nota (opcional)",
+            value=(ss.get("_payout_edit_nota", "") if ss.get("payout_edit_id") else ""),
+            key=f"payout_note_{ss.get('payout_edit_id') or 'new'}"
+        )
         default_fecha = (ss.get("_payout_edit_fecha") or date.today())
-        fecha_val = st.date_input("Fecha", value=default_fecha, format="YYYY-MM-DD")  # no se abre solo
+        fecha_val = st.date_input(
+            "Fecha", value=default_fecha, format="YYYY-MM-DD",
+            key=f"payout_date_{ss.get('payout_edit_id') or 'new'}"
+        )
 
-        bcol1, bcol2, bcol3 = st.columns([.6, .2, .2])
+        bcol1, bcol2 = st.columns([.6, .4])
         ok = bcol1.form_submit_button("Guardar")
         cancel = bcol2.form_submit_button("Cancelar")
         if ok and float(monto_val) > 0:
@@ -454,7 +526,6 @@ def _render_payout_dialog_content(ini: str, fin: str):
             st.rerun()
 
     st.markdown("---")
-    # Listado del mes (SOLO dentro del popup)
     payouts = _get_payouts(ini, fin)
     if not payouts:
         st.info("Sin pagos registrados en este mes.")
@@ -472,16 +543,13 @@ def _render_payout_dialog_content(ini: str, fin: str):
                 ss._payout_edit_fecha = datetime.strptime(e["fecha"], "%Y-%m-%d").date()
                 ss._payout_edit_monto = float(e["monto"])
                 ss._payout_edit_nota  = e.get("nota") or ""
-                # reabrir una sola vez para editar
                 ss.payout_open_once = True
                 st.rerun()
             if c5.button("🗑", key=f"payout_del_{e['id']}"):
                 _del_payout(e["id"])
-                # reabrir una sola vez para ver el listado actualizado
                 ss.payout_open_once = True
                 st.rerun()
 
-    # Cerrar (cuando no hay st.dialog, botón Cerrar)
     try:
         getattr(st, "dialog")
     except AttributeError:
@@ -489,9 +557,7 @@ def _render_payout_dialog_content(ini: str, fin: str):
             _close_payout_modal()
             st.rerun()
 
-
 def _close_payout_modal():
-    """Limpia campos; no reabre el popup a menos que se presione la lupa."""
     ss = st.session_state
     ss.payout_edit_id = None
     ss._payout_edit_fecha = None
