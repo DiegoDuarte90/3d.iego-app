@@ -220,6 +220,7 @@ def render():
     # Estado UI
     ss = st.session_state
     ss.setdefault("show_payout_modal", False)
+    ss.setdefault("payout_modal_armed", False)  # ← clave: solo se arma con la lupa
     ss.setdefault("payout_edit_id", None)
     ss.setdefault("_payout_edit_fecha", None)
     ss.setdefault("_payout_edit_monto", None)
@@ -255,9 +256,12 @@ def render():
             "<div class='muted'>= Ganancia individual − pagos registrados</div>",
             unsafe_allow_html=True
         )
-        if st.button("🔎 Gestionar pagos", key="btn_open_payout_dialog"):
+        # Solo arma y abre el modal al click
+        if st.button("🔎", key="btn_open_payout_dialog"):
             ss.show_payout_modal = True
+            ss.payout_modal_armed = True   # ← se arma acá
             ss.payout_edit_id = None
+            st.rerun()
 
     with cB:
         color_cls = "kpiv neg" if gan_individual < D(0) else "kpiv"
@@ -313,7 +317,7 @@ def render():
     pagos = _fetch_pagos(ini, fin)
     if not pagos:
         st.info("Sin pagos en este mes.")
-        _maybe_open_payout_dialog(ini, fin)  # por si quedó abierto
+        _maybe_open_payout_dialog(ini, fin)  # por si quedó armado y abierto
         return
 
     st.subheader("Pagos del mes")
@@ -396,15 +400,18 @@ def render():
     c3.write(f"**Ganancia individual (mes):** {money(gan_individual)}")
     c4.write(f"**Pago a Romina (mes):** {money(pago_a_romina)}")
 
-    _maybe_open_payout_dialog(ini, fin)  # popup si está abierto
+    # Render del popup SOLO si fue armado por la lupa
+    _maybe_open_payout_dialog(ini, fin)
 
 
 # ====================== Popup "lupa" pagos Romina ======================
 
 def _maybe_open_payout_dialog(ini: str, fin: str):
     ss = st.session_state
-    if not ss.get("show_payout_modal"):
+    # ← condición estricta: solo renderiza si fue "armado" explícitamente por el botón
+    if not (ss.get("show_payout_modal") and ss.get("payout_modal_armed")):
         return
+
     try:
         dialog = getattr(st, "dialog")
     except AttributeError:
@@ -440,18 +447,10 @@ def _render_payout_dialog_content(ini: str, fin: str):
             else:
                 _update_payout(ss["payout_edit_id"], fecha_val.strftime("%Y-%m-%d"), float(monto_val), nota_val)
             # limpiar estado y cerrar
-            ss.show_payout_modal = False
-            ss.payout_edit_id = None
-            ss._payout_edit_fecha = None
-            ss._payout_edit_monto = None
-            ss._payout_edit_nota  = ""
+            _close_payout_modal()
             st.rerun()
         if cancel:
-            ss.show_payout_modal = False
-            ss.payout_edit_id = None
-            ss._payout_edit_fecha = None
-            ss._payout_edit_monto = None
-            ss._payout_edit_nota  = ""
+            _close_payout_modal()
             st.rerun()
 
     st.markdown("---")
@@ -483,9 +482,16 @@ def _render_payout_dialog_content(ini: str, fin: str):
         getattr(st, "dialog")
     except AttributeError:
         if st.button("Cerrar"):
-            ss.show_payout_modal = False
-            ss.payout_edit_id = None
-            ss._payout_edit_fecha = None
-            ss._payout_edit_monto = None
-            ss._payout_edit_nota  = ""
+            _close_payout_modal()
             st.rerun()
+
+
+def _close_payout_modal():
+    """Resetea todas las flags del modal para que no vuelva a abrirse solo."""
+    ss = st.session_state
+    ss.show_payout_modal = False
+    ss.payout_modal_armed = False
+    ss.payout_edit_id = None
+    ss._payout_edit_fecha = None
+    ss._payout_edit_monto = None
+    ss._payout_edit_nota  = ""
