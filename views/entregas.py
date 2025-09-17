@@ -32,7 +32,8 @@ def render():
     ss.setdefault("sel_rev", DEFAULT_OPT)
     ss.setdefault("reset_sel_rev", False)
 
-    ss["show_entrega_modal"] = ss.get("show_entrega_modal", False) and bool(ss.get("modal_entrega_id"))
+    # ---- Control del popup (abrir una sola vez) ----
+    ss.setdefault("ent_modal_once", False)      # ← clave: se activa en la lupa
     ss.setdefault("modal_entrega_id", None)
     ss.setdefault("modal_entrega_nro", None)
 
@@ -124,7 +125,8 @@ def render():
             ss.ent_pieza = ""
             ss.ent_cantidad = 1
             ss.ent_precio = 0.0
-            ss.show_entrega_modal = False
+            # Al agregar pieza, nos aseguramos de que no quede armado el modal
+            ss.ent_modal_once = False
             ss.modal_entrega_id = None
             ss.modal_entrega_nro = None
             st.rerun()
@@ -183,7 +185,8 @@ def render():
                     st.success(f"Entrega N° {info['entrega_nro']} guardada por ${info['total']:,.2f}. PDF: {filename}")
                     ss.ent_items = []
                     ss.particular_nombre = ""
-                    ss.show_entrega_modal = False
+                    # cerrar y limpiar flags de modal
+                    ss.ent_modal_once = False
                     ss.modal_entrega_id = None
                     ss.modal_entrega_nro = None
                     st.rerun()
@@ -221,10 +224,11 @@ def render():
             c2.write(r["fecha_fmt"])
             c3.write(f"{r['total']:,.0f}")
 
+            # 🔎 — preparar apertura "una sola vez"
             if c4.button("🔎", key=f"det_ent_{r['id']}"):
-                st.session_state.show_entrega_modal = True
-                st.session_state.modal_entrega_id = r["id"]
-                st.session_state.modal_entrega_nro = r["entrega_nro"]
+                ss.ent_modal_once = True
+                ss.modal_entrega_id = r["id"]
+                ss.modal_entrega_nro = r["entrega_nro"]
                 st.rerun()
 
             if c5.button("✖", key=f"del_ent_{r['id']}"):
@@ -236,12 +240,17 @@ def render():
                     pass
                 db.delete_entrega(r["id"])
                 st.success(f"Entrega N° {r['entrega_nro']} eliminada.")
+                # aseguro modal apagado
+                ss.ent_modal_once = False
+                ss.modal_entrega_id = None
+                ss.modal_entrega_nro = None
                 st.rerun()
 
             if c6.button("PDF", key=f"pdf_{r['id']}"):
-                st.session_state.show_entrega_modal = False
-                st.session_state.modal_entrega_id = None
-                st.session_state.modal_entrega_nro = None
+                # aseguro modal apagado
+                ss.ent_modal_once = False
+                ss.modal_entrega_id = None
+                ss.modal_entrega_nro = None
                 pdf_path, filename = _pdf_path_for_row(r)
                 if pdf_path.exists():
                     _open_pdf_new_tab(pdf_path.read_bytes(), filename)
@@ -261,8 +270,8 @@ def render():
                     st.download_button("⬇️", data=pdf_bytes, file_name=filename,
                                        mime="application/pdf", key=f"dl_reg_{r['id']}")
 
-    if ss.get("show_entrega_modal") and ss.get("modal_entrega_id"):
-        _open_entrega_dialog(ss.modal_entrega_id, ss.modal_entrega_nro)
+    # Render del modal SOLO si fue pedido explícitamente en esta corrida
+    _maybe_open_entrega_dialog()
 
     _fixed_bar()  # barra fija con botón Subir
 
@@ -366,16 +375,21 @@ def _regenerate_and_offer_pdf(r, open_new_tab: bool = False):
                            mime="application/pdf", key=f"dl_reg_{r['id']}")
 
 
-def _open_entrega_dialog(entrega_id: int, entrega_nro: int):
+def _maybe_open_entrega_dialog():
+    """Abre el modal SOLO si fue solicitado por la lupa en esta corrida."""
+    ss = st.session_state
+    if not (ss.get("ent_modal_once") and ss.get("modal_entrega_id")):
+        return
+
     try:
         dialog = getattr(st, "dialog")
     except AttributeError:
         dialog = None
 
     if dialog:
-        @dialog(f"Detalle Entrega N° {entrega_nro}")
+        @dialog(f"Detalle Entrega N° {ss.get('modal_entrega_nro')}")
         def _dlg():
-            _render_modal_detalle(entrega_id)
+            _render_modal_detalle(ss["modal_entrega_id"])
         _dlg()
     else:
         st.markdown("""
@@ -388,9 +402,12 @@ def _open_entrega_dialog(entrega_id: int, entrega_nro: int):
 }
 </style>
 <div id="overlay"></div>
-<div id="modal"><h4>Detalle Entrega N° """ + str(entrega_nro) + """</h4></div>
+<div id="modal"><h4>Detalle Entrega N° """ + str(ss.get("modal_entrega_nro")) + """</h4></div>
 """, unsafe_allow_html=True)
-        _render_modal_detalle(entrega_id)
+        _render_modal_detalle(ss["modal_entrega_id"])
+
+    # ¡Clave! evitar reabrir en reruns posteriores
+    ss.ent_modal_once = False
 
 
 def _render_modal_detalle(entrega_id: int):
@@ -402,7 +419,8 @@ def _render_modal_detalle(entrega_id: int):
         st.dataframe(df, width="stretch")
     col1, col2 = st.columns([1, 1])
     if col1.button("Cerrar", key="close_ent_modal"):
-        st.session_state.show_entrega_modal = False
+        # limpiar flags para que no reabra
+        st.session_state.ent_modal_once = False
         st.session_state.modal_entrega_id = None
         st.session_state.modal_entrega_nro = None
         st.rerun()
