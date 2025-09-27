@@ -76,6 +76,10 @@ def render():
 
     # Obtener lista de revendedores
     data = db.get_revendedores(q)
+
+    # 🔎 Filtro: eliminar "Particulares (manual)"
+    data = [r for r in data if r["nombre"].strip().lower() != "particulares (manual)"]
+
     if not data:
         st.warning("No se encontraron revendedores.")
         return
