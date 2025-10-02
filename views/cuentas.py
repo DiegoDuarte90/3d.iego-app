@@ -189,6 +189,12 @@ def _get_payouts(ini: str, fin: str):
 
 # ---------- Totales desde splits ----------
 def _totals_from_splits(ini: str, fin: str):
+    """
+    Devuelve:
+      - gan_total: ganancia bruta global del mes (suma(importe - costo))
+      - gm_total : ganancia de cada uno (50% de la ganancia bruta)
+      - cost_total: suma de todos los costos del mes
+    """
     with db.get_conn() as c:
         rows = c.execute("""
             SELECT s.part_amount AS amt, s.cost_divisor AS div
@@ -198,6 +204,7 @@ def _totals_from_splits(ini: str, fin: str):
         """, (ini, fin)).fetchall()
     gan_total = D(0)
     gm_total  = D(0)
+    cost_total = D(0)
     for r in rows:
         amt = D(r["amt"]); div = D(int(r["div"]) if int(r["div"]) else 1)
         costo = amt / div
@@ -205,7 +212,8 @@ def _totals_from_splits(ini: str, fin: str):
         gm    = gan / D(2)
         gan_total += gan
         gm_total  += gm
-    return gan_total, gm_total
+        cost_total += costo
+    return gan_total, gm_total, cost_total
 
 # ---------- Pagos manuales (particulares) ----------
 def _add_manual_payment_particular(cliente: str, fecha_iso: str, monto: float, medio_pago: str):
@@ -216,7 +224,6 @@ def _add_manual_payment_particular(cliente: str, fecha_iso: str, monto: float, m
     rid = _ensure_particular_rev_id()
     detalle_txt = f"Particular: {cliente.strip()}"
     with db.get_conn() as c:
-        # NOTA: incluimos 'detalle' para satisfacer el NOT NULL constraint de tu esquema.
         c.execute(
             "INSERT INTO movimientos(rev_id, tipo, fecha, monto, medio_pago, detalle) VALUES (?,?,?,?,?,?)",
             (rid, "pago", fecha_iso, float(monto), medio_pago, detalle_txt)
@@ -275,7 +282,7 @@ def render():
     ini, fin = _month_bounds(mes_sel)
 
     # ---- Totales (ventas + gastos) ----
-    gan_total, gm_total = _totals_from_splits(ini, fin)
+    gan_total, gm_total, cost_total = _totals_from_splits(ini, fin)
     expenses = _get_expenses(ini, fin)
     gastos_total = D(sum(float(e["monto"]) for e in expenses))
 
@@ -324,10 +331,12 @@ def render():
         )
 
     with cD:
-        gan_neta_mes = gan_total - gastos_total
+        # Reemplazo: antes mostraba "Ganancia neta (global)"
         st.markdown(
-            "<div class='kpicard'><div class='kpititle'>Ganancia neta (global)</div>"
-            f"<div class='kpiv'>{money(gan_neta_mes)}</div></div>",
+            "<div class='kpicard'><div class='kpititle'>Costo mensual</div>"
+            f"<div class='kpiv'>{money(cost_total)}</div>"
+            "<div class='muted'>Suma de costos de todas las partes del mes</div>"
+            "</div>",
             unsafe_allow_html=True
         )
 

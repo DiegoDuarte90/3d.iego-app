@@ -13,6 +13,46 @@ from lib.pdfgen import build_entrega_pdf  # PDF directo con ReportLab
 DEFAULT_OPT = "— Elegir revendedor —"
 
 
+# ===== Helpers de STOCK =====
+def _load_stock_index():
+    """
+    Trae filas de stock con toda la info necesaria para sugerencias:
+    id, pieza, cantidad, categoria, subtipo
+    """
+    try:
+        with db.get_conn() as c:
+            rows = c.execute("""
+                SELECT id, pieza, cantidad, categoria, subtipo
+                FROM stock_items
+                ORDER BY UPPER(pieza), UPPER(COALESCE(categoria,'')), UPPER(COALESCE(subtipo,''))
+            """).fetchall()
+        items = [dict(r) for r in rows]
+        by_id = {int(r["id"]): r for r in items}
+        return items, by_id
+    except Exception:
+        return [], {}
+
+
+def _dec_stock_bulk(movimientos: dict[int, int]):
+    """
+    movimientos: dict {stock_id: delta_negativo}
+    Aplica: nueva_cantidad = max(0, cantidad + delta)
+    """
+    if not movimientos:
+        return
+    with db.get_conn() as c:
+        for sid, delta in movimientos.items():
+            cur = c.execute("SELECT cantidad FROM stock_items WHERE id=?", (int(sid),)).fetchone()
+            if not cur:
+                continue
+            actual = int(cur["cantidad"])
+            aplicado = int(delta)
+            if actual + aplicado < 0:
+                aplicado = -actual
+            nuevo = actual + aplicado
+            c.execute("UPDATE stock_items SET cantidad=? WHERE id=?", (nuevo, int(sid)))
+
+
 def render():
     # Ancla para el botón "↑ Subir"
     st.markdown('<a id="top"></a>', unsafe_allow_html=True)
@@ -33,9 +73,13 @@ def render():
     ss.setdefault("reset_sel_rev", False)
 
     # ---- Control del popup (abrir una sola vez) ----
-    ss.setdefault("ent_modal_once", False)      # ← clave: se activa en la lupa
+    ss.setdefault("ent_modal_once", False)      # ← se activa en la lupa
     ss.setdefault("modal_entrega_id", None)
     ss.setdefault("modal_entrega_nro", None)
+
+    # ---- Fix Streamlit: resets seguros para widgets de pieza ----
+    ss.setdefault("reset_pieza_sel", False)
+    ss.setdefault("reset_pieza_txt", False)
 
     # ---------------- Selección cliente ----------------
     st.subheader("Seleccione cliente")
@@ -93,21 +137,63 @@ def render():
     else:
         st.warning("Elegí un **revendedor** o cargá un **particular** para continuar.")
 
+    # ====== STOCK: cargar sugerencias e índice ======
+    stock_items, stock_by_id = _load_stock_index()
+
     # ---------------- Agregar pieza ----------------
     st.markdown("---")
     st.subheader("Agregar pieza")
 
-    cA, cB, cC, cD, cE = st.columns([1.1, 3, 1.1, 1.1, 1.1])
+    # --- resets para evitar StreamlitAPIException (se ejecutan antes de instanciar widgets) ---
+    if ss.get("reset_pieza_sel"):
+        st.session_state["inp_pieza_sel"] = "— Otra (personalizada) —"
+        ss.reset_pieza_sel = False
+    if ss.get("reset_pieza_txt"):
+        st.session_state["inp_pieza_txt"] = ""
+        ss.reset_pieza_txt = False
+    # -------------------------------------------------------------------------------------------
+
+    # Construimos etiquetas únicas por fila: "pieza – categoria – subtipo"
+    def _fmt_label(s):
+        cat = s.get("categoria") or "sin categoría"
+        sub = s.get("subtipo") or "sin subtipo"
+        return f"{s['pieza']} – {cat} – {sub}"
+
+    stock_labels = [_fmt_label(s) for s in stock_items]
+    stock_ids    = [int(s["id"]) for s in stock_items]  # paralelo a labels
+
+    pieza_select = st.selectbox(
+        "Pieza / Descripción",
+        options=["— Otra (personalizada) —"] + stock_labels,
+        index=0,
+        key="inp_pieza_sel",
+        help="Escribí para buscar en stock (sugiere por nombre, categoría y subtipo), o elegí 'Otra' para cargar manual"
+    )
+
+    chosen_stock_id = None
+    chosen_cat = None
+    chosen_sub = None
+    if pieza_select == "— Otra (personalizada) —":
+        # Campo libre (no vincula a stock)
+        ss.ent_pieza = st.text_input("Personalizada", value=ss.ent_pieza, key="inp_pieza_txt")
+    else:
+        # Selección exacta de una fila de stock (sin ambigüedad)
+        idx = stock_labels.index(pieza_select)     # índice dentro de stock_labels
+        chosen_stock_id = stock_ids[idx]           # ID preciso
+        chosen = stock_items[idx]
+        ss.ent_pieza = chosen["pieza"]             # el nombre que quedará en la entrega
+        chosen_cat = chosen.get("categoria")
+        chosen_sub = chosen.get("subtipo")
+
+    cA, cB, cC, cD = st.columns([1.1, 1.1, 1.1, 1.1])
     with cA:
         ss.ent_fecha = st.date_input("Fecha", value=ss.ent_fecha, key="inp_fecha")
     with cB:
-        ss.ent_pieza = st.text_input("Pieza / Descripción", value=ss.ent_pieza, key="inp_pieza")
-    with cC:
         ss.ent_cantidad = st.number_input("Cantidad", min_value=1, step=1, value=ss.ent_cantidad, key="inp_cant")
-    with cD:
+    with cC:
         ss.ent_precio = st.number_input("Precio x pieza", min_value=0.0, step=100.0,
                                         value=float(ss.ent_precio), format="%.2f", key="inp_precio")
-    with cE:
+    with cD:
         total_vivo = float(ss.ent_cantidad) * float(ss.ent_precio)
         st.text_input("Total", value=f"{total_vivo:,.2f}", disabled=True)
 
@@ -115,37 +201,65 @@ def render():
         if not ss.ent_pieza.strip():
             st.warning("Ingresá una descripción.")
         else:
+            name = ss.ent_pieza.strip()
+            stock_id = chosen_stock_id  # None si fue personalizada
             ss.ent_items.append({
-                "pieza": ss.ent_pieza.strip(),
+                "pieza": name,
                 "cantidad": int(ss.ent_cantidad),
                 "precio": float(ss.ent_precio),
-                "total": float(total_vivo),
+                "total": float(float(ss.ent_cantidad) * float(ss.ent_precio)),
                 "fecha": ss.ent_fecha,
+                "stock_id": int(stock_id) if stock_id is not None else None,
+                "cat": chosen_cat if stock_id is not None else None,
+                "sub": chosen_sub if stock_id is not None else None,
             })
+            # limpiar inputs
             ss.ent_pieza = ""
             ss.ent_cantidad = 1
             ss.ent_precio = 0.0
-            # Al agregar pieza, nos aseguramos de que no quede armado el modal
+
+            # en lugar de escribir directamente los keys de los widgets, uso banderas + rerun
+            ss.reset_pieza_sel = True
+            ss.reset_pieza_txt = True
+
+            # limpiar modal flags
             ss.ent_modal_once = False
             ss.modal_entrega_id = None
             ss.modal_entrega_nro = None
+
             st.rerun()
 
     # -------------- Piezas agregadas --------------
     if ss.ent_items:
         st.markdown("#### Piezas agregadas")
-        cols = st.columns([3, 1.2, 1.2, 1.2, 0.8])
-        cols[0].markdown("**Pieza**")
-        cols[1].markdown("**Cantidad**")
-        cols[2].markdown("**Precio**")
-        cols[3].markdown("**Total**")
-        cols[4].markdown("**Borrar**")
 
-        suma = 0.0
-        for i, it in enumerate(ss.ent_items):
-            c1, c2, c3, c4, c5 = st.columns([3, 1.2, 1.2, 1.2, 0.8])
-            c1.write(it["pieza"])
+        # Encabezado con índice a la izquierda
+        cols = st.columns([0.6, 3, 1.2, 1.2, 1.2, 1.6, 0.8])
+        cols[0].markdown("**#**")
+        cols[1].markdown("**Pieza**")
+        cols[2].markdown("**Cantidad**")
+        cols[3].markdown("**Precio**")
+        cols[4].markdown("**Total**")
+        cols[5].markdown("**Estado**")
+        cols[6].markdown("**Borrar**")
 
+        suma_importe = 0.0
+        suma_cantidades = 0
+
+        for i, it in enumerate(ss.ent_items, start=1):
+            c0, c1, c2, c3, c4, c5, c6 = st.columns([0.6, 3, 1.2, 1.2, 1.2, 1.6, 0.8])
+
+            # Número de pieza (1,2,3,…)
+            c0.write(i)
+
+            # Descripción mostrada: "Categoría Pieza" si viene de stock; si no, tal cual
+            if it.get("stock_id") and (it.get("cat") or it.get("sub") is not None):
+                cat_txt = it.get("cat") or ""
+                c1.write(f"{cat_txt} {it['pieza']}".strip())
+            else:
+                c1.write(it["pieza"])
+
+            # Cantidad (editable)
             new_qty = c2.number_input(" ", min_value=1, step=1, value=int(it["cantidad"]),
                                       key=f"qty_{i}", label_visibility="collapsed")
             if new_qty != it["cantidad"]:
@@ -153,29 +267,72 @@ def render():
                 it["total"] = float(it["cantidad"]) * float(it["precio"])
                 st.rerun()
 
+            # Precio y total
             c3.write(f"{it['precio']:,.2f}")
             c4.write(f"{it['total']:,.2f}")
-            suma += it["total"]
 
-            if c5.button("✖", key=f"del_item_{i}"):
-                ss.ent_items.pop(i)
+            suma_importe += it["total"]
+            suma_cantidades += int(it["cantidad"])
+
+            # Estado stock / personalizado
+            if it.get("stock_id"):
+                # Muestra la etiqueta exacta con "pieza – cat – sub" para ver a cuál descuenta
+                cat = it.get("cat") or "sin categoría"
+                sub = it.get("sub") or "sin subtipo"
+                c5.markdown(f"<div class='pill'>Stock ✓ · {it['pieza']} – {cat} – {sub}</div>", unsafe_allow_html=True)
+            else:
+                c5.markdown("<div class='pill'>Personalizado</div>", unsafe_allow_html=True)
+
+            # Borrar
+            if c6.button("✖", key=f"del_item_{i}"):
+                ss.ent_items.pop(i-1)
                 st.rerun()
 
-        st.markdown(f"### Total: **${suma:,.2f}**")
+        # Totales: cantidad de piezas (suma de cantidades) + total $
+        st.markdown(
+            f"**Ítems:** {len(ss.ent_items)} &nbsp; · &nbsp; "
+            f"**Cantidad total de piezas:** {suma_cantidades} &nbsp; · &nbsp; "
+            f"**Total:** ${suma_importe:,.2f}"
+        )
 
         if st.button("Guardar entrega"):
             if cli["tipo"] not in ("rev", "part"):
                 st.warning("Seleccioná un revendedor o cargá un particular.")
             else:
                 fecha_iso = (ss.ent_items[-1]["fecha"]).strftime("%Y-%m-%d")
-                items = [{k: it[k] for k in ("pieza","cantidad","precio","total")} for it in ss.ent_items]
+
+                # === Guardar piezas con "Categoría Pieza" si vienen de stock ===
+                items_to_save = []
+                for it in ss.ent_items:
+                    display_name = it["pieza"]
+                    if it.get("stock_id"):
+                        cat = (it.get("cat") or "").strip()
+                        if cat:
+                            display_name = f"{cat} {display_name}".strip()
+                    items_to_save.append({
+                        "pieza": display_name,
+                        "cantidad": int(it["cantidad"]),
+                        "precio": float(it["precio"]),
+                        "total": float(it["total"]),
+                    })
+
                 try:
+                    # 1) Guardar la entrega
                     info = db.save_entrega(
                         rev_id=(cli["rev_id"] if cli["tipo"] == "rev" else None),
                         cliente=(cli["nombre"] if cli["tipo"] == "part" else None),
                         fecha=fecha_iso,
-                        items=items,
+                        items=items_to_save,
                     )
+                    # 2) Descontar stock solo de ítems vinculados
+                    movimientos = {}
+                    for it in ss.ent_items:
+                        sid = it.get("stock_id")
+                        if sid:
+                            movimientos[sid] = movimientos.get(sid, 0) - int(it["cantidad"])
+                    _dec_stock_bulk(movimientos)
+
+                    # 3) PDF + reset UI
                     pdf_bytes, saved_path, filename = _build_pdf_for_entrega(
                         entrega_id=info["entrega_id"],
                         entrega_nro=info["entrega_nro"],
@@ -185,6 +342,11 @@ def render():
                     st.success(f"Entrega N° {info['entrega_nro']} guardada por ${info['total']:,.2f}. PDF: {filename}")
                     ss.ent_items = []
                     ss.particular_nombre = ""
+                    ss.ent_pieza = ""
+                    ss.ent_cantidad = 1
+                    ss.ent_precio = 0.0
+                    ss.reset_pieza_sel = True
+                    ss.reset_pieza_txt = True
                     # cerrar y limpiar flags de modal
                     ss.ent_modal_once = False
                     ss.modal_entrega_id = None
@@ -374,7 +536,6 @@ def _regenerate_and_offer_pdf(r, open_new_tab: bool = False):
         st.download_button("Descargar PDF", data=pdf_bytes, file_name=filename,
                            mime="application/pdf", key=f"dl_reg_{r['id']}")
 
-
 def _maybe_open_entrega_dialog():
     """Abre el modal SOLO si fue solicitado por la lupa en esta corrida."""
     ss = st.session_state
@@ -406,7 +567,7 @@ def _maybe_open_entrega_dialog():
 """, unsafe_allow_html=True)
         _render_modal_detalle(ss["modal_entrega_id"])
 
-    # ¡Clave! evitar reabrir en reruns posteriores
+    # evitar reabrir en reruns posteriores
     ss.ent_modal_once = False
 
 
@@ -427,7 +588,7 @@ def _render_modal_detalle(entrega_id: int):
 
 
 def _fixed_bar():
-    # Igual que en detalle_revendedor.py pero SOLO con "↑ Subir"
+    # Barra fija con "↑ Subir"
     st.markdown("""
 <style>
 .block-container { padding-bottom: 96px; }
@@ -446,6 +607,7 @@ def _fixed_bar():
   border: 1px solid rgba(255,255,255,.15);
 }
 #fixed-actions a:hover{ filter: brightness(1.15); }
+.pill{display:inline-block;border:1px solid #2a2f3a;border-radius:.6rem;padding:.15rem .4rem}
 </style>
 <div id="fixed-actions">
   <a href="#top" target="_self">↑ Subir</a>
